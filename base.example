@@ -1,0 +1,650 @@
+/************************************************************************
+
+ This code forms the base of the operating system you will
+ build.  It has only the barest rudiments of what you will
+ eventually construct; yet it contains the interfaces that
+ allow test.c and z502.c to be successfully built together.
+
+ Revision History:
+ 1.0 August 1990
+ 1.1 December 1990: Portability attempted.
+ 1.3 July     1992: More Portability enhancements.
+ Add call to SampleCode.
+ 1.4 December 1992: Limit (temporarily) printout in
+ interrupt handler.  More portability.
+ 2.0 January  2000: A number of small changes.
+ 2.1 May      2001: Bug fixes and clear STAT_VECTOR
+ 2.2 July     2002: Make code appropriate for undergrads.
+ Default program start is in test0.
+ 3.0 August   2004: Modified to support memory mapped IO
+ 3.1 August   2004: hardware interrupt runs on separate thread
+ 3.11 August  2004: Support for OS level locking
+ 4.0  July    2013: Major portions rewritten to support multiple threads
+ 4.20 Jan     2015: Thread safe code - prepare for multiprocessors
+ ************************************************************************/
+
+#include             "global.h"
+#include             "syscalls.h"
+#include             "protos.h"
+#include             "string.h"
+#include             <stdlib.h>
+#include             <ctype.h>
+#include             "ReadyQueue.h"
+#include             "TimerQueue.h"
+#include             "DiskQueue.h"
+
+#define MAX_PROCESS 15
+//  Allows the OS and the hardware to agree on where faults occur
+extern void *TO_VECTOR[];
+
+char *call_names[]={ "mem_read ", "mem_write", "read_mod ", "get_time ",
+		"sleep    ", "get_pid  ", "create   ", "term_proc", "suspend  ",
+		"resume   ", "ch_prior ", "send     ", "receive  ", "PhyDskRd ",
+		"PhyDskWrt", "def_sh_ar", "Format   ", "CheckDisk", "Open_Dir ",
+        "OpenFile ", "Crea_Dir ", "Crea_File", "ReadFile ", "WriteFile",
+		"CloseFile", "DirContnt", "Del_Dir  ", "Del_File "};
+
+// structure declaration
+struct  timer_PCB *pcb;
+int process_id = 0;
+int process_count = 0;
+
+/************************************************************************
+ osStartProcess
+ ************************************************************************/
+void osStartProcess(void *context) {
+    MEMORY_MAPPED_IO mmio;
+    memcpy(&mmio, context, sizeof(MEMORY_MAPPED_IO));
+    mmio.Mode = Z502StartContext;
+    mmio.Field2 = START_NEW_CONTEXT_AND_SUSPEND;
+    MEM_WRITE(Z502Context, &mmio);
+}
+
+/************************************************************************
+ Dispatchcer
+ ************************************************************************/
+void osDisPatcher() {
+    while(Queue_R_IsEmpty())
+        CALL("Wait!");
+
+    struct ready_PCB *ready_process = Get_R_Head();
+    pcb = (struct  timer_PCB *)ready_process;
+    Queue_R_Dequeue();
+    osStartProcess(&ready_process->context);
+}
+
+/************************************************************************
+ Make_Ready_To_Run
+ ************************************************************************/
+void Make_Ready_To_Run() {
+    struct timer_PCB *front = Get_T_Head();
+
+    front->wakeUptime = 0;
+    Queue_T_Dequeue();
+    Queue_R_Dequeue((struct ready_PCB*) front);
+}
+
+/************************************************************************
+ INTERRUPT_HANDLER
+ When the Z502 gets a hardware interrupt, it transfers control to
+ this routine in the OS.
+ ************************************************************************/
+void InterruptHandler(void) {
+	INT32 DeviceID;
+	INT32 Status;
+
+	MEMORY_MAPPED_IO mmio;       // Enables communication with hardware
+
+	static BOOL remove_this_in_your_code = TRUE; /** TEMP **/
+	static INT32 how_many_interrupt_entries = 0; /** TEMP **/
+
+	// Get cause of interrupt
+	mmio.Mode = Z502GetInterruptInfo;
+	mmio.Field1 = mmio.Field2 = mmio.Field3 = 0;
+	MEM_READ(Z502InterruptDevice, &mmio);
+	DeviceID = (int)mmio.Field1;
+	Status = (int)mmio.Field2;
+
+
+
+    if(DeviceID == 4) {
+        //Timer interrupt
+        //Get first PCB in timer queue
+        //Move PCB to ready queue
+        Make_Ready_To_Run();
+
+        if(Queue_T_IsEmpty() == false) {
+            // get current time
+            mmio.Mode = Z502ReturnValue;
+            mmio.Field1 = mmio.Field2 = mmio.Field3 = 0;
+            MEM_READ(Z502Clock, &mmio);
+
+            // Start Timer
+            mmio.Mode = Z502Start;
+            mmio.Field1 = (long) Get_T_Head()->wakeUptime - mmio.Field1;
+            mmio.Field2 = mmio.Field3 = 0;
+            MEM_WRITE(Z502Timer, &mmio);
+        }
+    } else {
+        printf("Invalid Device\n");
+        return;
+    }
+
+
+	// Clear out this device - we're done with it
+	mmio.Mode = Z502ClearInterruptStatus;
+	mmio.Field1 = DeviceID;
+	mmio.Field2 = mmio.Field3 = 0;
+	MEM_WRITE(Z502InterruptDevice, &mmio);
+}   // End of InterruptHandler
+
+/************************************************************************
+ FAULT_HANDLER
+ The beginning of the OS502.  Used to receive hardware faults.
+ ************************************************************************/
+
+void FaultHandler(void) {
+	INT32 DeviceID;
+	INT32 Status;
+
+	MEMORY_MAPPED_IO mmio;       // Enables communication with hardware
+
+	// Get cause of interrupt
+	mmio.Field1 = mmio.Field2 = mmio.Field3 = 0;
+	mmio.Mode = Z502GetInterruptInfo;
+	MEM_READ(Z502InterruptDevice, &mmio);
+	DeviceID = (int)mmio.Field1;
+	Status = (int)mmio.Field2;
+
+	printf("Fault_handler: Found vector type %d with value %d\n", DeviceID, Status);
+	// Clear out this device - we're done with it
+	mmio.Mode = Z502ClearInterruptStatus;
+	mmio.Field1 = DeviceID;
+	MEM_WRITE(Z502InterruptDevice, &mmio);
+} // End of FaultHandler
+
+/************************************************************************
+ osCreateProcess
+ It will get Z502Context and then put it to ready queue
+ ************************************************************************/
+void osCreateProcess(SYSTEM_CALL_DATA *SystemCallData) {
+
+    char *processName = (char *)SystemCallData->Argument[0];
+    if(process_count >= 15 ||
+    		Find_T_ByName(processName) != NULL ||
+			Find_R_ByName(processName) != NULL) {
+        *(long *)(SystemCallData->Argument[4]) = ERR_BAD_PARAM;
+        return;
+    }
+
+    // step1 : get Z502 context
+    MEMORY_MAPPED_IO mmio;
+    mmio.Mode = Z502InitializeContext;
+    mmio.Field1 = 0;
+    mmio.Field2 = (long) SystemCallData->Argument[1];
+    mmio.Field3 = (long)(void *) calloc(2, NUMBER_VIRTUAL_PAGES);
+    MEM_WRITE(Z502Context, &mmio);
+
+    // step2 : PCB initialization
+    struct timer_PCB *newpcb = (struct timer_PCB *)malloc(sizeof(struct timer_PCB));
+    memset(newpcb, 0, sizeof(struct timer_PCB));
+    newpcb->pid = process_id++;
+    newpcb->state = 10;
+
+    int nameLen = (int)strlen(processName);
+    newpcb->processName = (char *)malloc(nameLen + 1);
+    memcpy(newpcb->processName, processName, nameLen);
+    memset(newpcb->processName + nameLen, 0, 1);
+    memcpy(&newpcb->context, &mmio, sizeof(MEMORY_MAPPED_IO));
+    newpcb->wakeUptime = 0;
+
+    // step3 : Put pcb into ready queue
+    Queue_R_Enqueue((struct ready_process_struct *)newpcb);
+
+    // step4 : return process id and status
+    *(long *)(SystemCallData->Argument[3]) = newpcb->pid;
+    *(long *)(SystemCallData->Argument[4]) = mmio.Field4;
+    process_count++;
+}
+
+/************************************************************************
+ osGetTimeOfDay
+ ************************************************************************/
+void osGetTimeOfDay(SYSTEM_CALL_DATA *SystemCallData) {
+    MEMORY_MAPPED_IO mmio;
+    mmio.Mode = Z502ReturnValue;
+    mmio.Field1 = mmio.Field2 = mmio.Field3 = 0;
+    MEM_READ(Z502Clock, &mmio);
+    *(long *)(SystemCallData->Argument[0]) = mmio.Field1;
+}
+
+/************************************************************************
+ osStartTimer
+ ************************************************************************/
+void osSleep(SYSTEM_CALL_DATA *SystemCallData) {
+    MEMORY_MAPPED_IO mmio;
+    // get current time
+    mmio.Mode = Z502ReturnValue;
+    mmio.Field1 = mmio.Field2 = mmio.Field3 = 0;
+    MEM_READ(Z502Clock, &mmio);
+
+    // Add current process's PCB into timer queue
+    pcb->wakeUptime = mmio.Field1 + (long)SystemCallData->Argument[0];
+    struct  process_struct *prev = osTimerFront();
+    osTimerEnqueue(pcb);
+
+    // Start Timer
+    if(prev == NULL || pcb->interrupt_time <= prev->interrupt_time) {
+        mmio.Mode = Z502Start;
+        mmio.Field1 = (long)SystemCallData->Argument[0];
+        mmio.Field2 = mmio.Field3 = 0;
+        MEM_WRITE(Z502Timer, &mmio);
+    }
+
+#if 0
+    // Go idle until the interrupt occurs
+    mmio.Mode = Z502Action;
+    mmio.Field1 = mmio.Field2 = mmio.Field3 = 0;
+    MEM_WRITE(Z502Idle, &mmio);       //  Let the interrupt for this timer occur
+#endif
+    osDisPatcher();
+}
+
+/************************************************************************
+ osGetProcessID
+ ************************************************************************/
+void osGetProcessID(SYSTEM_CALL_DATA *SystemCallData) {
+    //MEMORY_MAPPED_IO mmio;
+    char *process_name = (char *) SystemCallData->Argument[0];
+    if(strlen(process_name) != 0) {
+        struct process_struct *timerFind = NULL;
+        struct ready_process_struct *readyFind = NULL;
+        readyFind = (struct ready_process_struct *)osReadyQueueSearchByName(process_name);
+        if(readyFind != NULL) {
+            *(long *)(SystemCallData->Argument[1]) = readyFind->process_id;
+            *(long *)(SystemCallData->Argument[2]) = ERR_SUCCESS;
+        }
+
+        if(readyFind == NULL) {
+            timerFind = (struct timer_PCB *)osTimerSearchByName(process_name);
+            if(timerFind != NULL) {
+                *(long *)(SystemCallData->Argument[1]) = timerFind->process_id;
+                *(long *)(SystemCallData->Argument[2]) = ERR_SUCCESS;
+            }
+        }
+
+        if(readyFind == NULL && readyFind == NULL){
+            *(long *)(SystemCallData->Argument[1]) = -1;
+            *(long *)(SystemCallData->Argument[2]) = ERR_BAD_PARAM;
+        }
+    } else {
+        // get current contex
+        /*
+        MEMORY_MAPPED_IO mmio;
+        mmio.Mode = Z502GetCurrentContext;
+        mmio.Field1 = 0;
+        mmio.Field2 = 0;
+        mmio.Field3 = 0;
+        MEM_READ(Z502Context, &mmio);
+        long contextID = mmio.Field1;
+        */
+        *(long *)(SystemCallData->Argument[1]) = pcb->process_id;
+        *(long *)(SystemCallData->Argument[2]) = ERR_SUCCESS;
+    }
+}
+
+/************************************************************************
+ osTerminateProcess
+ ************************************************************************/
+void osTerminateProcess(SYSTEM_CALL_DATA *SystemCallData) {
+    MEMORY_MAPPED_IO mmio;
+    int mode = (int)SystemCallData->Argument[0];
+
+    process_count--;
+    if(mode == -1) {
+        if(osTimerIsEmpty() && osReadyQueueIsEmpty()) {
+            mmio.Mode = Z502Action;
+            mmio.Field1 = mmio.Field2 = mmio.Field3 = 0;
+            MEM_WRITE(Z502Halt, &mmio);
+        } else {
+            osDisPatcher();
+        }
+    } else if(mode == -2) {
+        mmio.Mode = Z502Action;
+        mmio.Field1 = mmio.Field2 = mmio.Field3 = 0;
+        MEM_WRITE(Z502Halt, &mmio);
+    } else {
+        osReadyQueueRemove(mode);
+    }
+}
+
+/************************************************************************
+ osPhysicalDiskWrite
+ ************************************************************************/
+void osPhysicalDiskWrite(SYSTEM_CALL_DATA *SystemCallData) {
+    while(osDiskQueueSearch((long)SystemCallData->Argument[0]) != NULL) ;
+
+    MEMORY_MAPPED_IO mmio;
+    struct disk_struct *disk_in_use = (struct disk_struct *) malloc(sizeof(struct disk_struct));
+    disk_in_use->disk_id = (long)SystemCallData->Argument[0];
+    disk_in_use->sector = (long)SystemCallData->Argument[2];
+    osDiskQueueEnqueue(disk_in_use);
+
+    mmio.Mode = Z502DiskWrite;
+    mmio.Field1 = (long)SystemCallData->Argument[0];
+    mmio.Field2 = (long)SystemCallData->Argument[1];
+    mmio.Field3 = (long)SystemCallData->Argument[2];
+    MEM_WRITE(Z502Disk, &mmio);
+
+    mmio.Field2 = DEVICE_IN_USE;
+    while (mmio.Field2 != DEVICE_FREE) {
+        mmio.Mode = Z502Status;
+        mmio.Field1 = (long)SystemCallData->Argument[0];
+        mmio.Field2 = mmio.Field3 = 0;
+        MEM_READ(Z502Disk, &mmio);
+    }
+}
+
+/************************************************************************
+ osPhysicalDiskRead
+ ************************************************************************/
+void osPhysicalDiskRead(SYSTEM_CALL_DATA *SystemCallData) {
+    while(osDiskQueueSearch((long)SystemCallData->Argument[0]) != NULL)
+        CALL("Wait");
+
+    MEMORY_MAPPED_IO mmio;
+    struct disk_struct *disk_in_use = (struct disk_struct *) malloc(sizeof(struct disk_struct));
+    disk_in_use->disk_id = (long)SystemCallData->Argument[0];
+    disk_in_use->sector = (long)SystemCallData->Argument[2];
+    osDiskQueueEnqueue(disk_in_use);
+
+    mmio.Mode = Z502DiskRead;
+    mmio.Field1 = (long)SystemCallData->Argument[0];
+    mmio.Field2 = (long)SystemCallData->Argument[1];
+    mmio.Field3 = (long)SystemCallData->Argument[2];
+    MEM_WRITE(Z502Disk, &mmio);
+
+    mmio.Field2 = DEVICE_IN_USE;
+    while (mmio.Field2 != DEVICE_FREE) {
+        mmio.Mode = Z502Status;
+        mmio.Field1 = (long)SystemCallData->Argument[0];
+        mmio.Field2 = mmio.Field3 = 0;
+        MEM_READ(Z502Disk, &mmio);
+    }
+}
+
+/************************************************************************
+ osFormat
+ ************************************************************************/
+void osFormat(SYSTEM_CALL_DATA *SystemCallData) {
+    while(osDiskQueueSearch((long)SystemCallData->Argument[0]) != NULL) ;
+
+    MEMORY_MAPPED_IO mmio;
+    struct disk_struct *disk_in_use = (struct disk_struct *) malloc(sizeof(struct disk_struct));
+    disk_in_use->disk_id = (long)SystemCallData->Argument[0];
+    disk_in_use->sector = 0;
+    osDiskQueueEnqueue(disk_in_use);
+
+    // initialize the sector 0
+    char char_data[PGSIZE];
+    char_data[0] = (long)SystemCallData->Argument[0];
+    char_data[1] = 3; // 4x3 = 12 blocks, bitmap size
+    char_data[2] = 2; // 2 blocks, root directory size
+    char_data[3] = 2; // 4x2 = 8 blocks, Swap size
+    char_data[4] = 0; // Disklength, least significant byte, 256 blocks, most [0000 0001] least[0000 0000]
+    char_data[5] = 1; // Disklength, most significant byte
+    char_data[6] = 16; // Bitmap Location, least significant byte, 16th-31th block, most[0000 0000] least[0001 0000]
+    char_data[7] = 0; // Bitmap Location, most significant byte
+    char_data[6] = 2; // Swap Location, least significant byte, 2nd-9th block, most[0000 0000] least[0000 0010]
+    char_data[7] = 0; // Swap Location, most significant byte
+
+    mmio.Mode = Z502DiskWrite;
+    mmio.Field1 = (long)SystemCallData->Argument[0];
+    mmio.Field2 = 0;
+    mmio.Field3 = (long)char_data;
+    MEM_WRITE(Z502Disk, &mmio);
+
+    mmio.Field2 = DEVICE_IN_USE;
+    while (mmio.Field2 != DEVICE_FREE) {
+        mmio.Mode = Z502Status;
+        mmio.Field1 = (long)SystemCallData->Argument[0];
+        mmio.Field2 = mmio.Field3 = 0;
+        MEM_READ(Z502Disk, &mmio);
+    }
+}
+
+/************************************************************************
+ osCheckDisk
+ ************************************************************************/
+void osCheckDisk(SYSTEM_CALL_DATA *SystemCallData) {
+    MEMORY_MAPPED_IO mmio;
+    mmio.Mode = Z502CheckDisk;
+    mmio.Field1 = (long)SystemCallData->Argument[0];
+    mmio.Field2 = mmio.Field3 = 0;
+    MEM_READ(Z502Disk, &mmio);
+}
+
+/************************************************************************
+ SVC
+ The beginning of the OS502.  Used to receive software interrupts.
+ All system calls come to this point in the code and are to be
+ handled by the student written code here.
+ The variable do_print is designed to print out the data for the
+ incoming calls, but does so only for the first ten calls.  This
+ allows the user to see what's happening, but doesn't overwhelm
+ with the amount of data.
+ ************************************************************************/
+
+void svc(SYSTEM_CALL_DATA *SystemCallData) {
+	short call_type;
+	static short do_print = 10;
+	short i;
+	MEMORY_MAPPED_IO mmio;
+
+	call_type = (short) SystemCallData->SystemCallNumber;
+	if (do_print > 0) {
+		printf("SVC handler: %s\n", call_names[call_type]);
+		for (i = 0; i < SystemCallData->NumberOfArguments - 1; i++) {
+			//Value = (long)*SystemCallData->Argument[i];
+			printf("Arg %d: Contents = (Decimal) %8ld,  (Hex) %8lX\n", i,
+					(unsigned long) SystemCallData->Argument[i],
+					(unsigned long) SystemCallData->Argument[i]);
+		}
+		do_print--;
+	}
+
+	switch (call_type) {
+		//Get time service call
+		case SYSNUM_GET_TIME_OF_DAY:
+            osGetTimeOfDay(SystemCallData);
+			break;
+
+		case SYSNUM_SLEEP:
+			osSleep(SystemCallData);
+			break;
+
+		case SYSNUM_CREATE_PROCESS:
+            osCreateProcess(SystemCallData);
+			break;
+
+		case SYSNUM_GET_PROCESS_ID:
+            osGetProcessID(SystemCallData);
+			break;
+
+		case SYSNUM_TERMINATE_PROCESS:
+            osTerminateProcess(SystemCallData);
+			break;
+
+		case SYSNUM_PHYSICAL_DISK_WRITE:
+            osPhysicalDiskWrite(SystemCallData);
+			break;
+
+		case SYSNUM_PHYSICAL_DISK_READ:
+            osPhysicalDiskRead(SystemCallData);
+			break;
+
+        case SYSNUM_FORMAT:
+            osFormat(SystemCallData);
+            break;
+
+        case SYSNUM_CHECK_DISK:
+            osCheckDisk(SystemCallData);
+            break;
+
+		default:
+			printf( "ERROR! call_type not recognized!\n" );
+			printf( "Call_type is - %i\n", call_type);
+	}
+}                                               // End of svc
+
+/************************************************************************
+ osInit
+ This is the first routine called after the simulation begins.  This
+ is equivalent to boot code.  All the initial OS components can be
+ defined and initialized here.
+ ************************************************************************/
+
+void osInit(int argc, char *argv[]) {
+	void *PageTable = (void *) calloc(2, NUMBER_VIRTUAL_PAGES);
+	INT32 i;
+	MEMORY_MAPPED_IO mmio;
+
+	// Demonstrates how calling arguments are passed thru to here
+
+	printf("Program called with %d arguments:", argc);
+	for (i = 0; i < argc; i++)
+		printf(" %s", argv[i]);
+	printf("\n");
+	printf("Calling with argument 'sample' executes the sample program.\n");
+
+	// Here we check if a second argument is present on the command line.
+	// If so, run in multiprocessor mode
+	if (argc > 2) {
+		if ( strcmp( argv[2], "M") || strcmp( argv[2], "m")) {
+		printf("Simulation is running as a MultProcessor\n\n");
+		mmio.Mode = Z502SetProcessorNumber;
+		mmio.Field1 = MAX_NUMBER_OF_PROCESSORS;
+		mmio.Field2 = (long) 0;
+		mmio.Field3 = (long) 0;
+		mmio.Field4 = (long) 0;
+		MEM_WRITE(Z502Processor, &mmio);   // Set the number of processors
+		}
+	} else {
+		printf("Simulation is running as a UniProcessor\n");
+		printf(
+				"Add an 'M' to the command line to invoke multiprocessor operation.\n\n");
+	}
+
+	//          Setup so handlers will come to code in base.c
+
+	TO_VECTOR[TO_VECTOR_INT_HANDLER_ADDR ] = (void *) InterruptHandler;
+	TO_VECTOR[TO_VECTOR_FAULT_HANDLER_ADDR ] = (void *) FaultHandler;
+	TO_VECTOR[TO_VECTOR_TRAP_HANDLER_ADDR ] = (void *) svc;
+
+	//  Determine if the switch was set, and if so go to demo routine.
+    SYSTEM_CALL_DATA *SystemCallData = (SYSTEM_CALL_DATA *)calloc(1, sizeof(SYSTEM_CALL_DATA));
+
+	if (argc > 1 && strcmp(argv[1], "sample") == 0)
+		mmio.Field2 = (long) SampleCode;
+    else if(argc > 1) {
+        long pid;
+        long ErrorReturned;
+        if(strcmp(argv[1], "test0") == 0) {
+            char name[] = "test0";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test0;
+        } else if(strcmp(argv[1], "test1") == 0) {
+            char name[] = "test1";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test1;
+        } else if(strcmp(argv[1], "test2") == 0) {
+            char name[] = "test2";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test2;
+        } else if(strcmp(argv[1], "test3") == 0) {
+            char name[] = "test3";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test3;
+        } else if(strcmp(argv[1], "test4") == 0) {
+            char name[] = "test4";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test4;
+        } else if(strcmp(argv[1], "test5") == 0) {
+            char name[] = "test5";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test5;
+        } else if(strcmp(argv[1], "test6") == 0) {
+            char name[] = "test6";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test6;
+        } else if(strcmp(argv[1], "test7") == 0) {
+            char name[] = "test7";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test7;
+        } else if(strcmp(argv[1], "test8") == 0) {
+            char name[] = "test8";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test8;
+        } else if(strcmp(argv[1], "test9") == 0) {
+            char name[] = "test9";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test9;
+        } else if(strcmp(argv[1], "test10") == 0) {
+            char name[] = "test10";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test10;
+            SystemCallData->Argument[1] = (long *)test6;
+        } else if(strcmp(argv[1], "test11") == 0) {
+            char name[] = "test11";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test7;
+        } else if(strcmp(argv[1], "test12") == 0) {
+            char name[] = "test12";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test8;
+        } else if(strcmp(argv[1], "test13") == 0) {
+            char name[] = "test13";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test9;
+        } else if(strcmp(argv[1], "test14") == 0) {
+            char name[] = "test14";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test10;
+            SystemCallData->Argument[1] = (long *)test6;
+        } else if(strcmp(argv[1], "test15") == 0) {
+            char name[] = "test15";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test7;
+        } else if(strcmp(argv[1], "test16") == 0) {
+            char name[] = "test16";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test8;
+        } else if(strcmp(argv[1], "test17") == 0) {
+            char name[] = "test17";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test9;
+        } else if(strcmp(argv[1], "test18") == 0) {
+            char name[] = "test18";
+            SystemCallData->Argument[0] = (long *)name;
+            SystemCallData->Argument[1] = (long *)test10;
+        }
+        SystemCallData->Argument[3] = &pid;
+        SystemCallData->Argument[4] = &ErrorReturned;
+        osCreateProcess(SystemCallData);
+        osDisPatcher();
+    } else if(argc == 1) {
+		mmio.Mode = Z502InitializeContext;
+		mmio.Field1 = 0;
+		mmio.Field2 = (long) test0;
+		mmio.Field3 = (long) PageTable;
+
+		MEM_WRITE(Z502Context, &mmio);   // Start this new Context Sequence
+		mmio.Mode = Z502StartContext;
+		// Field1 contains the value of the context returned in the last call
+		// Suspends this current thread
+		mmio.Field2 = START_NEW_CONTEXT_AND_SUSPEND;
+		MEM_WRITE(Z502Context, &mmio);
+	}
+}   // End of osInit
+
+
